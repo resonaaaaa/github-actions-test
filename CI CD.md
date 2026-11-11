@@ -138,9 +138,9 @@ jobs:
     └── ci.yml
 ```
 
-最初可以只在推送到 `main` 或向 `main` 提交 Pull Request 时，检出代码、安装 Go、执行 `go vet ./...`，再运行不需要数据库的测试。这样能先确认触发条件与 Go 环境是否正确。不过，项目的 `internal/application/integration_test.go` 在 `TestMain` 中连接测试库；只检查不依赖 MySQL 的包，**并不能证明订单创建、库存扣减和数据库迁移可用**。
+最初可以只在推送到 `main` 或向 `main` 提交 Pull Request 时，检出代码、安装 Go、执行 `go vet ./...`，再运行不需要数据库的测试。这样能先确认触发条件与 Go 环境是否正确。不过只检查不依赖 MySQL 的包，**并不能证明订单创建、库存扣减和数据库迁移可用**。
 
-还有一个容易忽略的细节：`go test ./internal/config ./internal/service` 看起来覆盖了两个包，但当前 `internal/service` 没有测试文件。我们最后需要让 CI 执行 `go test -count=1 ./...`，把应用层的集成测试也纳入进来。`-count=1` 让这次测试实际执行，而不是复用 Go 的测试结果缓存。
+还有一个容易忽略的细节：我们需要让 CI 执行 `go test -count=1 ./...`，把应用层的集成测试也纳入进来。`-count=1` 强制让这次测试实际执行1次，而不是复用 Go 的测试结果缓存。
 
 ## 给测试提供 MySQL 服务容器
 
@@ -173,7 +173,9 @@ jobs:
           --health-retries=10
 ```
 
-这里 `runs-on: ubuntu-latest` 让 Job 直接运行在 Ubuntu Runner 上；MySQL 才运行在旁边的容器里。因此 Go 测试连接的是 Runner 的 `localhost:3306`，`ports: 3306:3306` 将容器的 3306 端口映射到 Runner 的 3306 端口。它与前面 Docker Compose 中 **API 容器通过服务名 `mysql:3306` 连接数据库** 的场景不同。如果整个 Job 也运行在容器里，连接方式才会改为使用服务名。[服务容器网络说明](https://docs.github.com/en/actions/tutorials/use-containerized-services/use-docker-service-containers)
+这里 `runs-on: ubuntu-latest` 让 Job 直接运行在 Ubuntu Runner 上；MySQL 才运行在旁边的容器里。因此 Go 测试连接的是 Runner 的 `localhost:3306`，`ports: 3306:3306` 将容器的 3306 端口映射到 Runner 的 3306 端口。
+
+它与前面 Docker Compose 中 **API 容器通过服务名 `mysql:3306` 连接数据库** 的场景不同。如果整个 Job 也运行在容器里，连接方式才会改为使用服务名。[服务容器网络说明](https://docs.github.com/en/actions/tutorials/use-containerized-services/use-docker-service-containers)
 
 `MYSQL_DATABASE` 只负责创建空的 `go_backend_test` 数据库，并不会自动创建 `users`、`products`、`orders` 等表。`--health-cmd` 则让 Runner 等待 MySQL 对 `ping` 有响应后再开始步骤；它也不能证明应用账号、权限或表结构都正确。真正的连接和表结构仍要交给测试验证。
 

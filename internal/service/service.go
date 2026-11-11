@@ -116,7 +116,7 @@ func (s *OrderService) CreateOrder(ctx context.Context, userID int64, productID 
 	}
 	var createdOrder *Order
 
-	maxRetries := 3
+	maxRetries := 5
 	if err := s.uow.DoWithinTxWithRetry(ctx, func(ctx context.Context, repos *Repositories) error {
 		order := &Order{
 			UserID:    userID,
