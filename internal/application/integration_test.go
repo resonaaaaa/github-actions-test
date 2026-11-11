@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -13,10 +14,11 @@ import (
 	"example.com/go_backend/internal/repository"
 	"example.com/go_backend/internal/service"
 
-	_ "github.com/go-sql-driver/mysql"
+	mysql "github.com/go-sql-driver/mysql"
 	"github.com/golang-migrate/migrate/v4"
 	_ "github.com/golang-migrate/migrate/v4/database/mysql"
 	_ "github.com/golang-migrate/migrate/v4/source/file"
+	"github.com/joho/godotenv"
 )
 
 func openTestDB(t *testing.T) *sql.DB {
@@ -325,12 +327,28 @@ func TestCreateOrderConcurrentInsufficientStock(t *testing.T) {
 }
 
 func MigrateUp() error {
-
 	dbURL := os.Getenv("MIGRATE_TEST_DATABASE_URL")
 	if dbURL == "" {
 		return fmt.Errorf("MIGRATE_TEST_DATABASE_URL is required")
 	}
-	mig, err := migrate.New("file://migrations", dbURL)
+
+	goDSN := os.Getenv("MYSQL_GO_DSN")
+	if goDSN == "" {
+		return fmt.Errorf("MYSQL_GO_DSN is required")
+	}
+	goConfig, err := mysql.ParseDSN(goDSN)
+	if err != nil {
+		return fmt.Errorf("invalid MYSQL_GO_DSN: %w", err)
+	}
+	migrateConfig, err := mysql.ParseDSN(strings.TrimPrefix(dbURL, "mysql://"))
+	if err != nil {
+		return fmt.Errorf("invalid MIGRATE_TEST_DATABASE_URL: %w", err)
+	}
+	if goConfig.DBName != "go_backend_test" || migrateConfig.DBName != goConfig.DBName {
+		return fmt.Errorf("unsafe test database: both connections must target go_backend_test")
+	}
+
+	mig, err := migrate.New("file://../../migrations", dbURL)
 	if err != nil {
 		return fmt.Errorf("failed to create migrate instance: %w", err)
 	}
@@ -359,6 +377,19 @@ func resetTestData(t *testing.T, db *sql.DB) {
 }
 
 func TestMain(m *testing.M) {
+	if err := godotenv.Load("../../.env"); err != nil && !errors.Is(err, os.ErrNotExist) {
+		fmt.Printf("failed to load .env: %v\n", err)
+		os.Exit(1)
+	}
+	if os.Getenv("MYSQL_GO_DSN") == "" {
+		if dsn := os.Getenv("MYSQL_DSN"); dsn != "" {
+			if err := os.Setenv("MYSQL_GO_DSN", dsn); err != nil {
+				fmt.Printf("failed to set MYSQL_GO_DSN: %v\n", err)
+				os.Exit(1)
+			}
+		}
+	}
+
 	if err := MigrateUp(); err != nil {
 		fmt.Printf("failed to apply migrations: %v\n", err)
 		os.Exit(1)

@@ -15,15 +15,15 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      MYSQL_TEST_DSN: "app:app@tcp(localhost:3306)/go_backend?parseTime=true"
-      MIGRATE_DATABASE_URL: "mysql://app:app@tcp(localhost:3306)/go_backend?parseTime=true"
+      MYSQL_GO_DSN: "app:app@tcp(localhost:3306)/go_backend_test?parseTime=true"
+      MIGRATE_TEST_DATABASE_URL: "mysql://app:app@tcp(localhost:3306)/go_backend_test?parseTime=true"
 
     services:
       mysql:
         image: mysql:8.0
         env:
           MYSQL_ROOT_PASSWORD: root
-          MYSQL_DATABASE: go_backend
+          MYSQL_DATABASE: go_backend_test
           MYSQL_USER: app
           MYSQL_PASSWORD: app
         ports:
