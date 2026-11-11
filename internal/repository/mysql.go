@@ -63,11 +63,11 @@ func (uow *UnitOfWork) DoWithinTxWithRetry(
 		if err == nil {
 			return nil
 		}
-		if retry >= maxRetries {
-			return fmt.Errorf("failed to execute function within transaction after %d retries: %w", maxRetries, service.ErrMaxRetries)
-		}
 		if !IsDeadlock(err) {
 			return fmt.Errorf("failed to execute function within transaction: %w", err)
+		}
+		if retry >= maxRetries {
+			return fmt.Errorf("failed to execute function within transaction after %d retries: %w: %w", maxRetries, service.ErrMaxRetries, err)
 		}
 
 	}

@@ -136,12 +136,12 @@ func (s *OrderService) CreateOrder(ctx context.Context, userID int64, productID 
 		createdOrder = order
 		createdOrder.UnitPrice = product.Price_cents
 
-		if err := repos.Order.Create(ctx, createdOrder); err != nil {
-			return fmt.Errorf("failed to create order: %w", err)
-		}
-
 		if err := repos.Product.DecreaseStock(ctx, productID, quantity); err != nil {
 			return fmt.Errorf("failed to decrease stock: %w", err)
+		}
+
+		if err := repos.Order.Create(ctx, createdOrder); err != nil {
+			return fmt.Errorf("failed to create order: %w", err)
 		}
 
 		return nil
