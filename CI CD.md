@@ -124,61 +124,101 @@ jobs:
 
 只要把这个文件推送到 GitHub，以后每次提交代码，GitHub 的页面上就会显示流水线的运行状态。你可以点开每个 Job，看到每个 Step 的执行日志，方便排查问题。
 
-# 设计第一个GO CI
-## 创建workflow文件
-在项目根目录下创建：
+# 设计第一个 GO CI
+
+前面的例子让我们知道了 Workflow、Job 和 Step 分别是什么，但把 Node.js 示例原样搬进订单系统并不能完成检查。我们的项目使用 Go，还包含真正连接 MySQL 的订单集成测试。**第一个 CI 要回答的问题是：代码离开本机后，能否在一台干净的机器上完成检查？**
+
+## 从只检查 Go 代码开始
+
+先在项目根目录创建 Workflow 文件：
+
 ```plaintext
 .github/
 └── workflows/
     └── ci.yml
 ```
 
-接下来配置 ci.yml 文件，内容如下：
+最初可以只在推送到 `main` 或向 `main` 提交 Pull Request 时，检出代码、安装 Go、执行 `go vet ./...`，再运行不需要数据库的测试。这样能先确认触发条件与 Go 环境是否正确。不过，项目的 `internal/application/integration_test.go` 在 `TestMain` 中连接测试库；只检查不依赖 MySQL 的包，**并不能证明订单创建、库存扣减和数据库迁移可用**。
+
+还有一个容易忽略的细节：`go test ./internal/config ./internal/service` 看起来覆盖了两个包，但当前 `internal/service` 没有测试文件。我们最后需要让 CI 执行 `go test -count=1 ./...`，把应用层的集成测试也纳入进来。`-count=1` 让这次测试实际执行，而不是复用 Go 的测试结果缓存。
+
+## 给测试提供 MySQL 服务容器
+
+GitHub 托管的 Runner 不会带着我们的本机 MySQL 和 `.env` 文件启动。如何让订单集成测试获得数据库？在 `test` Job 下配置 **Service container（服务容器）**。GitHub Actions 会为这个 Job 启动临时 MySQL 容器，Job 结束后再清理它。[服务容器说明](https://github.c-cpp.com/zh/actions/using-containerized-services/about-service-containers)
+
+下面摘出当前 `ci.yml` 的关键配置。这里的账号和密码只用于一次性测试数据库；真实环境的凭据不应写进 Workflow。
 
 ```yaml
-name: Go CI
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      MYSQL_GO_DSN: "app:app@tcp(localhost:3306)/go_backend_test?parseTime=true"
+      MIGRATE_TEST_DATABASE_URL: "mysql://app:app@tcp(localhost:3306)/go_backend_test?parseTime=true"
 
-# 配置 push、pull_request 触发条件
-on:
-    push:
-      branches: [ "main" ]
-    pull_request:
-      branches: [ "main" ]
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: go_backend_test
+          MYSQL_USER: app
+          MYSQL_PASSWORD: app
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -proot --silent"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+```
 
+这里 `runs-on: ubuntu-latest` 让 Job 直接运行在 Ubuntu Runner 上；MySQL 才运行在旁边的容器里。因此 Go 测试连接的是 Runner 的 `localhost:3306`，`ports: 3306:3306` 将容器的 3306 端口映射到 Runner 的 3306 端口。它与前面 Docker Compose 中 **API 容器通过服务名 `mysql:3306` 连接数据库** 的场景不同。如果整个 Job 也运行在容器里，连接方式才会改为使用服务名。[服务容器网络说明](https://docs.github.com/en/actions/tutorials/use-containerized-services/use-docker-service-containers)
+
+`MYSQL_DATABASE` 只负责创建空的 `go_backend_test` 数据库，并不会自动创建 `users`、`products`、`orders` 等表。`--health-cmd` 则让 Runner 等待 MySQL 对 `ping` 有响应后再开始步骤；它也不能证明应用账号、权限或表结构都正确。真正的连接和表结构仍要交给测试验证。
+
+为什么要传入两种连接串？`MYSQL_GO_DSN` 使用 Go MySQL 驱动的 DSN 格式，供集成测试执行 SQL；`MIGRATE_TEST_DATABASE_URL` 带有 `mysql://` 前缀，供 `golang-migrate` 使用。两者都指向 `go_backend_test`。当前测试代码会核对数据库名，并在 `TestMain` 中先执行 `migrations/` 的 SQL，再运行订单测试。这样每次新建的空库才能拥有订单系统所需的表。`.env` 文件没有提交到 Runner 也没关系，因为这个 Job 已经直接提供了测试需要的环境变量。
+
+## 完整的检查顺序
+
+在 MySQL 准备好后，同一个 Job 的 Step 按顺序执行。当前 Workflow 使用 `actions/checkout@v7` 拉取仓库，使用 `actions/setup-go@v7` 根据根目录 `go.mod` 中的 `go 1.27.0` 安装 Go。[setup-go 的版本文件说明](https://github.com/actions/setup-go/blob/main/docs/advanced-usage.md)
+
+```yaml
 permissions:
   contents: read
 
 jobs:
   test:
-    runs-on: ubuntu-latest
-
     steps:
-      #  检出代码
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
-      #  配置 Go 环境
-      # 从 go.mod 读取 Go 版本
       - name: 配置 Go 环境
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
 
-      # 执行静态检查
-      # go vet ./...
+      - name: 检查Go格式
+        run: test -z "$(gofmt -l .)"
+
       - name: 执行静态检查
         run: go vet ./...
 
-      # 执行不依赖 MySQL 的测试
-      # go test ./internal/config ./internal/service
-      - name: 执行不依赖 MySQL 的测试
-        run: go test ./internal/config ./internal/service
+      - name: 执行测试
+        run: go test -count=1 ./...
+
+      - name: 进行编译
+        run: go build ./...
 ```
 
-这里有不少细节：
-- `on` 字段配置了触发条件，只有当代码被 push 到 main 分支，或者有人发起 PR 到 main 分支时，才会触发 CI 流水线。
-- 使用`go-version-file: go.mod`，可以让 GitHub Actions 自动读取 go.mod 文件中指定的 Go 版本，比手动指定go 1.27.0 更方便。
-- 在第一个CI中我们避开依赖 MySQL 的测试，因为Github Runners 上没有本地的MySQL服务与`.env`文件。这需要我们之后配置测试依赖。
+上面只摘录了权限和步骤；`runs-on`、数据库环境变量及 `services` 仍使用前一节的配置。`contents: read` 给予检出代码所需的只读权限。
 
-## 在GitHub Actions中配置依赖
-### server container
+检查顺序也有原因：`gofmt -l .` 列出格式不符合 Go 规范的文件，`test -z` 要求输出为空，否则这一步失败；`go vet ./...` 检查 Go 能识别的一类可疑代码；`go test -count=1 ./...` 运行所有包的测试，包括依赖 MySQL 的集成测试；最后 `go build ./...` 确认项目包可以编译。前一步失败，后面的普通步骤就不会继续执行。`go vet` 和编译通过也不等于业务正确，所以订单测试不可省略。
+
+## 如何确认 CI 真的生效
+
+把 `.github/workflows/ci.yml` 和代码推送到 GitHub 后，进入仓库的 **Actions** 页面，打开 `Go CI` 的运行记录。可以依次查看检出代码、配置 Go 环境、格式检查、静态检查、测试和编译的日志；若从 PR 触发，也可以在 PR 的检查状态里看到结果。[查看工作流运行记录](https://github.c-cpp.com/zh/actions/monitoring-and-troubleshooting-workflows/viewing-workflow-run-history)
+
+如果失败，要看**第一个失败的步骤**。例如格式检查失败时，先在本机执行 `gofmt -l .` 找到文件；测试阶段出现 `failed to ping database`，重点检查 MySQL 健康状态、端口和 DSN；出现 Migration 错误，则检查 `migrations/` 文件和测试库是否一致。当前 `ci.yml` 已包含上述配置；是否在 GitHub Runner 上通过，还需要以实际的 Actions 运行记录为准。
+
+这个 CI 的边界也很明确：它验证代码格式、静态问题、测试和编译，**还没有打包镜像或部署生产环境**。等这些检查稳定后，再讨论 Docker 构建与后续交付流程。
