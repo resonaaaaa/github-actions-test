@@ -1,0 +1,61 @@
+name: Go CI
+
+# 配置 push、pull_request 触发条件
+on:
+    push:
+      branches: [ "main" ]
+    pull_request:
+      branches: [ "main" ]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    env:
+      MYSQL_TEST_DSN: "app:app@tcp(localhost:3306)/go_backend?parseTime=true"
+      MIGRATE_DATABASE_URL: "mysql://app:app@tcp(localhost:3306)/go_backend?parseTime=true"
+
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: go_backend
+          MYSQL_USER: app
+          MYSQL_PASSWORD: app
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -proot --silent"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
+    steps:
+      #  检出代码
+      - name: 检出代码
+        uses: actions/checkout@v7
+
+      #  配置 Go 环境
+      # 从 go.mod 读取 Go 版本
+      - name: 配置 Go 环境
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+        
+      - name: 检查Go格式
+        run: test -z "$(gofmt -l .)"
+
+      # 执行静态检查
+      # go vet ./...
+      - name: 执行静态检查
+        run: go vet ./...
+
+      - name: 执行测试
+        run: go test -count=1 ./...
+
+      - name: 进行编译
+        run: go build ./...
