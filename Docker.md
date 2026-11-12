@@ -637,11 +637,11 @@ $body = @{
 
 $headers = @{ "Idempotency-Key" = "docker-note-$(Get-Date -Format 'yyyyMMddHHmmss')" }
 
-$order = Invoke-RestMethod `
-    -Uri "http://127.0.0.1:8080/orders" `
-    -Method POST `
-    -Headers $headers `
-    -ContentType "application/json" `
+$order = Invoke-RestMethod 
+    -Uri "http://127.0.0.1:8080/orders" 
+    -Method POST 
+    -Headers $headers 
+    -ContentType "application/json" 
     -Body $body
 
 $order

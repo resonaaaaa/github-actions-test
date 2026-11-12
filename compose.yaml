@@ -8,7 +8,7 @@ services:
       MYSQL_PASSWORD: ${MYSQL_PASSWORD:?"MYSQL_PASSWORD is required"}
     ports:
       # 映射 Windows 3307 到容器 3306
-      - "127.0.0.1:3307:3306"
+      - "127.0.0.1:13307:3306"
     volumes:
       # 挂载 mysql-data 到 /var/lib/mysql
       - mysql-data:/var/lib/mysql
@@ -20,12 +20,12 @@ services:
       start_period: 30s
 
   migrate:
-    image: migrate/migrate:v4.18.3
+    image: ${MIGRATION_IMAGE:?"MIGRATION_IAMGE is required"}
+    volumes: !reset []
+
     depends_on:
       mysql:
         condition: service_healthy
-    volumes:
-      - ./migrations:/migrations:ro
     command:
       - "-path=/migrations"
       - "-database=${DOCKER_MIGRATE_DATABASE_URL}"

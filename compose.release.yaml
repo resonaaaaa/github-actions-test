@@ -1,0 +1,8 @@
+services:
+  api:
+    # 使用 GHCR 的镜像，覆盖基础 compose.yaml 中的 build
+    image: ${API_IMAGE:?API_IMAGE is required}
+    
+    build: !reset null
+
+    pull_policy: missing

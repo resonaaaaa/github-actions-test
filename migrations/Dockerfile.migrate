@@ -1,0 +1,3 @@
+FROM migrate/migrate:v4.18.3
+# 只复制sql文件
+COPY *.sql /migrations/  

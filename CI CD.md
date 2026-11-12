@@ -173,7 +173,7 @@ jobs:
           --health-retries=10
 ```
 
-这里 `runs-on: ubuntu-latest` 让 Job 直接运行在 Ubuntu Runner 上；MySQL 才运行在旁边的容器里。因此 Go 测试连接的是 Runner 的 `localhost:3306`，`ports: 3306:3306` 将容器的 3306 端口映射到 Runner 的 3306 端口。
+这里 `runs-on: ubuntu-latest` 让 Go的测试进程直接运行在 Ubuntu Runner 上，因为我们没有使用 `jobs.test.container` 配置启动容器。而`services,mysql` 则告诉Github Actions:另外启动一个 MySQL 容器,为`test`这个 Job 提供数据库服务。因此 Go 测试连接的是 Runner 的 `localhost:3306`，`ports: 3306:3306` 将容器的 3306 端口映射到 Runner 的 3306 端口。
 
 它与前面 Docker Compose 中 **API 容器通过服务名 `mysql:3306` 连接数据库** 的场景不同。如果整个 Job 也运行在容器里，连接方式才会改为使用服务名。[服务容器网络说明](https://docs.github.com/en/actions/tutorials/use-containerized-services/use-docker-service-containers)
 
@@ -225,13 +225,14 @@ jobs:
 
 到这一步，CI 已验证代码格式、静态问题、测试和编译。下面继续让测试通过的代码自动构建 Docker 镜像。
 
-# 自动构建 Docker 镜像
+# Continuous Delivery：持续交付
+## 自动构建 Docker 镜像
 
 第一个 Go CI 已经能在干净的 Runner 上启动 MySQL、执行 Migration、运行订单测试并编译代码。接下来会遇到一个问题：**既然代码已经通过检查，能不能顺手把将来要部署的 Docker 镜像也构建出来？**
 
 我们在上一章已经写好两阶段 `Dockerfile`：第一阶段用 Go 编译 `./cmd/server`，第二阶段只把可执行文件放进 Alpine 运行镜像。现在让 GitHub Actions 在测试通过后执行这份 Dockerfile。我们先验证镜像能构建，再把通过检查的镜像发布到 GHCR。
 
-## 利用 `needs` 建立 Quality Gate
+### 利用 `needs` 建立 Quality Gate
 
 如果直接在 `jobs` 下新增 `docker-build`，它与 `test` 默认可以并行。这样可能出现订单集成测试还没结束，镜像却已经构建成功的情况。镜像构建成功只说明 Dockerfile 和源码可以打包，不能证明业务测试通过。
 
@@ -253,7 +254,7 @@ jobs:
 
 为什么把两个 Job 分开？一方面，Actions 页面会分别显示“代码检查”和“镜像构建”的结果；另一方面，将来增加镜像发布步骤时，依赖关系仍然清楚。代价是两个 Job 使用各自的 Runner，`docker-build` 需要再次检出代码；`test` Job 中启动的 MySQL 容器也不会带到这个 Job。构建镜像不运行集成测试，因此这里不需要再配置 MySQL。
 
-## Docker Buildx 与 BuildKit
+### Docker Buildx 与 BuildKit
 
 我们本机执行过 `docker build`。在 Actions 里，当前项目用 `docker/setup-buildx-action` 准备 **Buildx**，再用 `docker/build-push-action` 执行构建。Buildx 是 Docker 的构建工具接口，背后使用 **BuildKit** 构建引擎。[Docker 的 GitHub Actions 构建指南](https://docs.docker.com/build/ci/github-actions/)
 
@@ -285,7 +286,7 @@ docker-build:
 
 此时的 `push: false` 很关键：它只让构建步骤验证镜像可以生成，**不会把镜像推送到仓库**。这个初版配置也没有 `load: true`，因此不能把这个 Job 的结果当成已经安装到 Runner 本地 Docker 中、可供后续 Job 直接运行的镜像。想在别的机器上拉取它，还需要发布到 Registry。[build-push-action 输入说明](https://github.com/docker/build-push-action)
 
-## Docker Build Cache
+### Docker Build Cache
 
 每次 GitHub Actions 运行通常使用新 Runner。第一次构建下载过的 Go 模块和构建层，下一次运行不能直接从上一台 Runner 的本地磁盘读取。我们在构建步骤中配置了外部缓存：
 
@@ -298,11 +299,11 @@ cache-to: type=gha,mode=max
 
 这与 `test` Job 中 `actions/setup-go` 的缓存不是同一份东西：前者服务于 **Dockerfile 内的 BuildKit 构建**，后者服务于 **Runner 上执行的 Go 命令**。缓存也不是“保证每次都跳过构建”：首次运行没有可用缓存；修改 `go.mod` 或 `go.sum` 会影响依赖层；修改源码会让后续 `COPY . .` 和编译层重新计算。我们可以在 Actions 的“构建 Docker 镜像”日志里观察哪些步骤命中了缓存，再判断它有没有带来实际加速。
 
-## Docker Container Registry：把镜像交给 GHCR
+### Docker Container Registry：把镜像交给 GHCR
 
 前面 `push: false` 的配置只验证 Dockerfile 能构建。Job 一结束，另一台服务器既拿不到这个 Runner 的构建结果，也不能凭源码提交号直接执行 `docker pull`。我们需要一个 **Container Registry（容器镜像仓库）** 保存并分发构建产物。这里选 GitHub Container Registry，简称 **GHCR**；镜像地址形如 `ghcr.io/<仓库所有者>/<仓库名>:<标签>`。[GitHub Container Registry 文档](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry)
 
-### 先想清楚镜像标签
+#### 镜像标签
 
 假设今天和明天都向 `main` 提交了代码，两次构建都叫 `latest`。明天的镜像发布后，`latest` 就会指向新的内容。想重新部署今天的版本时，单靠 `latest` 无法准确找到它。
 
@@ -316,7 +317,7 @@ cache-to: type=gha,mode=max
 
 这里 `main` 和 `latest` 都是会移动的名称；`sha-*` 对应构建所用的提交，更方便追溯源码。Git Tag `v0.1.0` 经 `type=semver,pattern={{version}}` 生成镜像标签 `0.1.0`。但**标签本身可以被重新指向**；需要精确记录部署镜像时，还应保存 Registry 返回的 `sha256` Digest。Digest 标识镜像内容，适合作为日后核对或回滚的依据。[metadata-action 标签规则](https://github.com/docker/metadata-action)
 
-### 在 Workflow 中登录、生成标签、发布
+#### 在 Workflow 中登录、生成标签、发布
 
 现在看项目 `.github/workflows/ci.yml` 的构建 Job。下面是与 GHCR 有关的配置；原有的检出代码、配置 Buildx 和 `needs: test` 仍然保留：
 
@@ -379,12 +380,100 @@ jobs:
 
 这里还有一个权限边界：当前 `packages: write` 授给了整个 `docker-build` Job，而这个 Job 也会处理 PR。虽然 `if` 与 `push` 已阻止 PR 发布，权限本身仍比“只构建的 PR”所需范围大。Fork PR 的令牌通常会受到 GitHub 的只读限制；若以后要让同仓库 PR 也完全拿不到发布权限，应把只读构建与仅在可信推送事件运行的发布 Job 拆开。**不能只把 `push: false` 当作权限隔离。**[GitHub 关于 PR 令牌的说明](https://docs.github.com/en/actions/reference/security/securely-using-pull_request_target)
 
-### 如何验证这一阶段
+#### 如何验证这一阶段
 
 向 `main` 推送后，在 Actions 中确认 `test` 成功、`docker-build` 成功，再到仓库的 Packages 页面查找对应镜像。如果在 GitHub 看到了第一个 Package，就说明首次发布完成；接下来可以核对它的 `main`、`sha-*`、`latest` 标签与 Digest。若 Package 是私有的，其他机器拉取前还需要具备相应的读取权限。[GHCR 的访问说明](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry)
 
 目前我们完成的是 **源码 → 测试 → 构建 → GHCR 发布**。镜像已可分发，但还没有把它接入生产环境的 Docker Compose，也没有完成正式 Release 和部署回滚。下一节再把 Git Tag、镜像 Tag 与 Digest 的关系用于版本化交付。
 
-# Release 与部署回滚
-## 版本管理：语义化版本
-## 部署回滚
+## Release 与部署回滚
+
+我们已经把镜像发布到 GHCR，也完成了第一个 `v0.1.0` GitHub Release。现在要解决的问题是：**如果下一个版本上线后订单接口出了问题，怎样准确找回上一个可运行的版本？** 仅记住 `latest` 不够，因为它会随着后续发布移动；仅记住 Git Commit 也不够，因为部署机器最终运行的是构建出来的镜像。
+
+### 版本管理：语义化版本
+
+先把几个容易混在一起的名称分清楚：
+
+| 标识 | 在这个项目里标识什么 | 示例 |
+| --- | --- | --- |
+| Git Commit SHA | 某一次源码提交 | `a81f93c...` |
+| Git Tag | 给一个 Commit 标上发布版本 | `v0.1.0` |
+| GitHub Release | 与 Git Tag 关联的发布说明和可附加的交付文件 | `Go Backend v0.1.0` |
+| Docker Image Tag | GHCR 中便于人阅读的镜像名称 | `ghcr.io/<owner>/<repo>:0.1.0` |
+| Image Digest | Registry 中镜像内容的标识 | `ghcr.io/<owner>/<repo>@sha256:<digest>` |
+
+GitHub Release **不是存放 Docker 镜像的地方**：镜像在 GHCR 的 Package 中，Release 用来说明这次发布了什么，并可以写上对应的镜像地址。Git Tag 标记源码，镜像 Tag 标记构建产物；两者名字相近，却属于不同对象。[GitHub Releases 文档](https://docs.github.com/en/repositories/releasing-projects-on-github/about-releases)
+
+严格来说，Release并不是 CI/CD 的一部分。它是**交付的产物**，而不是流水线本身。理论上CI/CD仅需以下的流程：
+```
+Push to main
+    ↓
+CI Tests
+    ↓
+Docker Build
+    ↓
+Push to GHCR
+    ↓
+等待人工部署
+```
+不过使用Release进行版本管理，能让我们在 GHCR 中找到对应的镜像 Tag 和 Digest，让版本回滚更方便。
+
+----
+为什么我们的 Git Tag 是 `v0.1.0`，GHCR 镜像标签却是 `0.1.0`？因为当前 Workflow 使用 `type=semver,pattern={{version}}`，会取出版本号而去掉前面的 `v`。
+
+推送 `v*` Tag 时仍会先运行 Go 测试，测试通过后才构建并推送镜像。已经发布的第一个 Release 是 `v0.1.0`；不要因为镜像名称少了一个 `v`，误以为这是另一次发布。[metadata-action 的 SemVer 规则](https://github.com/docker/metadata-action#typesemver)
+
+#### 为什么从 `0.1.0` 开始
+
+Semantic Versioning（语义化版本，SemVer）使用 `MAJOR.MINOR.PATCH` 三段数字。在公共 API 已稳定的前提下，不兼容变更通常增加 MAJOR，向后兼容的新功能增加 MINOR，向后兼容的修复增加 PATCH。我们的订单系统还在学习与迭代阶段，接口和部署方式都可能调整，因此从 `0.1.0` 起步更合适。SemVer 把 `0.y.z` 视为初始开发阶段，**不能把 `0.x` 的版本号认为 API 已承诺稳定**。[语义化版本规范](https://semver.org/lang/zh-CN/spec/v2.0.0.html)
+
+例如，修复创建订单时偶发的库存判断错误，可以考虑发布 `0.1.1`；增加一个向后兼容的查询接口，可以考虑 `0.2.0`。这只是我们为学习项目采用的版本策略。版本号说明变更意图，并不会自动保证数据库、配置和旧客户端一定兼容。
+
+#### Tag 方便查找，Digest 用于精确定位
+
+`main` 与 `latest` 会在后续推送中移动；`0.1.0` 和 `sha-*` 也只是我们约定不重复使用的标签，Registry 并不会因为名字看起来固定就禁止它被重新指向。如果部署记录只写 `latest`，以后重新拉取时可能拿到另一份镜像。
+
+要查 GHCR 中某个镜像的实际 Digest，可以在准备部署的机器上执行下面的示例命令，先把 `<owner>/<repo>` 替换为实际仓库路径：
+
+```powershell
+docker buildx imagetools inspect ghcr.io/<owner>/<repo>:0.1.0
+```
+
+输出中的顶层 `Digest: sha256:...` 是该镜像引用当前指向的内容标识；输出也会列出可用的平台。记录完整的 `ghcr.io/<owner>/<repo>@sha256:...`，比只记 `0.1.0` 更适合日后核对部署内容。当前项目在 Ubuntu Runner 上构建，首次拉取实验还应核对镜像是否包含部署机器需要的 `linux/amd64` 平台。[Docker `imagetools inspect` 文档](https://docs.docker.com/reference/cli/docker/buildx/imagetools/inspect/)
+
+### 部署回滚
+
+目前 `compose.yaml` 的 `api` 服务仍使用 `build: { context: ., dockerfile: Dockerfile }`，适合从本地源码构建。但发布版部署则应该指定 GHCR 的镜像，让部署机器拉取经过 CI 检查的产物。我们**需要在项目中创建发布版 Compose 文件。
+
+#### 开发配置与发布配置如何共存
+
+我们可以保留现有 `compose.yaml` 用于开发，再新建 `compose.release.yaml` 作为发布覆盖文件。关键不能只增加 `image`：Compose 合并配置时，原来的 `api.build` 可能仍留在最终模型里。发布文件需要显式清除它：
+
+```yaml
+# 计划新建的 compose.release.yaml；
+services:
+  api:
+    build: !reset null
+    image: ${API_IMAGE:?API_IMAGE is required}
+```
+
+`!reset null` 清除基础文件中的 `build`，`API_IMAGE` 指向选定的 GHCR 镜像。创建文件后，先用 `docker compose -f compose.yaml -f compose.release.yaml config` 检查配置能否解析，再查看合并结果，确认 `api` 已没有 `build`。[Compose 合并与 `!reset` 说明](https://docs.docker.com/reference/compose-file/merge/)
+
+第一次实验应先单独拉取 `0.1.0`，核对平台和 Digest，再考虑切换正在运行的 API。若 GHCR Package 是私有的，部署机器需要有读取 Package 的权限；遇到 `denied` 或 `unauthorized` 时，先检查 Registry 认证，不要把它当成 Dockerfile 编译错误。**拉取镜像不会修改 MySQL 数据卷**，而真正切换 API 时需要同时确认它的数据库连接与 Migration 状态。[GHCR 访问说明](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry)
+
+#### 回滚时要恢复什么
+
+假设当前运行 `0.2.0`，上线后发现创建订单失败，我们希望回到已验证的 `0.1.0`。首先找到上次部署记录里的镜像 Digest，用它锁定旧镜像，而不是重新拉取可能已经变化的 `latest`。随后还要检查旧版 API 所需的配置、数据库 Schema 和数据是否仍兼容。回滚清单至少应记录：
+
+1. 上一次成功运行的镜像地址和 Digest，以及对应 Git Tag、Commit。
+2. 当时使用的 Compose 配置与环境变量版本；秘密值单独安全保存。
+3. 数据库 Migration 版本，以及升级前的数据备份或恢复点。
+4. 订单创建、查询、库存等关键接口的验收结果。
+
+为什么镜像回退了，数据库不能顺手执行所有 `Down Migration`？假设 `0.2.0` 增加 `orders.status` 字段，并已经写入“待支付”等状态。执行 `DROP COLUMN status` 会丢掉这些数据；旧版 API 即便还能读取其余字段，也不代表删除新字段是安全的。
+
+**应用回滚和数据库回滚是两项不同的决定。** 实际操作前要判断旧版应用能否在当前 Schema 上运行；若不能，还需要单独设计数据恢复方案。[项目已有的 Migration 说明](https://github.com/golang-migrate/migrate)
+
+更稳妥的 Schema 演进方式是先做向后兼容的扩展：先增加新字段并让新旧应用都能运行，再部署新应用；确认不再需要旧结构后，才在后续版本清理。这样出现问题时，先切回旧镜像，通常无需立刻破坏性回退数据库。这叫 **Expand and Contract（先扩展、后收缩）**；它是一种部署设计思路，具体兼容性仍需由我们的订单代码和 Migration 验证。
+
+## Migration 与无源码部署
