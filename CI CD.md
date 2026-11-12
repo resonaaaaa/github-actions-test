@@ -158,7 +158,7 @@ jobs:
 
     services:
       mysql:
-        image: mysql:8.0
+        image: mysql:8.0.46
         env:
           MYSQL_ROOT_PASSWORD: root
           MYSQL_DATABASE: go_backend_test
@@ -213,7 +213,7 @@ jobs:
         run: go build ./...
 ```
 
-上面只摘录了权限和步骤；`runs-on`、数据库环境变量及 `services` 仍使用前一节的配置。`contents: read` 给予检出代码所需的只读权限。
+`contents: read` 给予检出代码所需的只读权限。
 
 检查顺序也有原因：`gofmt -l .` 列出格式不符合 Go 规范的文件，`test -z` 要求输出为空，否则这一步失败；`go vet ./...` 检查 Go 能识别的一类可疑代码；`go test -count=1 ./...` 运行所有包的测试，包括依赖 MySQL 的集成测试；最后 `go build ./...` 确认项目包可以编译。前一步失败，后面的普通步骤就不会继续执行。`go vet` 和编译通过也不等于业务正确，所以订单测试不可省略。
 
@@ -223,4 +223,83 @@ jobs:
 
 如果失败，要看**第一个失败的步骤**。例如格式检查失败时，先在本机执行 `gofmt -l .` 找到文件；测试阶段出现 `failed to ping database`，重点检查 MySQL 健康状态、端口和 DSN；出现 Migration 错误，则检查 `migrations/` 文件和测试库是否一致。当前 `ci.yml` 已包含上述配置；是否在 GitHub Runner 上通过，还需要以实际的 Actions 运行记录为准。
 
-这个 CI 的边界也很明确：它验证代码格式、静态问题、测试和编译，**还没有打包镜像或部署生产环境**。等这些检查稳定后，再讨论 Docker 构建与后续交付流程。
+到这一步，CI 已验证代码格式、静态问题、测试和编译。下面继续让测试通过的代码自动构建 Docker 镜像。
+
+# 自动构建 Docker 镜像
+
+第一个 Go CI 已经能在干净的 Runner 上启动 MySQL、执行 Migration、运行订单测试并编译代码。接下来会遇到一个问题：**既然代码已经通过检查，能不能顺手把将来要部署的 Docker 镜像也构建出来？**
+
+我们在上一章已经写好两阶段 `Dockerfile`：第一阶段用 Go 编译 `./cmd/server`，第二阶段只把可执行文件放进 Alpine 运行镜像。现在让 GitHub Actions 在测试通过后执行这份 Dockerfile。本节先验证镜像能构建，发布到镜像仓库留到下一步。
+
+## 利用 `needs` 建立 Quality Gate
+
+如果直接在 `jobs` 下新增 `docker-build`，它与 `test` 默认可以并行。这样可能出现订单集成测试还没结束，镜像却已经构建成功的情况。镜像构建成功只说明 Dockerfile 和源码可以打包，不能证明业务测试通过。
+
+我们给构建 Job 增加依赖：
+
+```yaml
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # Go 格式检查、静态检查、MySQL 集成测试与编译
+
+  docker-build:
+    needs: test
+    runs-on: ubuntu-latest
+    # 构建 Docker 镜像
+```
+
+`needs: test` 的意思是：只有 `test` Job 成功，`docker-build` 才开始；如果测试失败或被跳过，构建 Job 默认也会被跳过。这就是这里的 **Quality Gate（质量门禁）**。[GitHub Actions 的 Job 依赖说明](https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/use-jobs)
+
+为什么把两个 Job 分开？一方面，Actions 页面会分别显示“代码检查”和“镜像构建”的结果；另一方面，将来增加镜像发布步骤时，依赖关系仍然清楚。代价是两个 Job 使用各自的 Runner，`docker-build` 需要再次检出代码；`test` Job 中启动的 MySQL 容器也不会带到这个 Job。构建镜像不运行集成测试，因此这里不需要再配置 MySQL。
+
+## Docker Buildx 与 BuildKit
+
+我们本机执行过 `docker build`。在 Actions 里，当前项目用 `docker/setup-buildx-action` 准备 **Buildx**，再用 `docker/build-push-action` 执行构建。Buildx 是 Docker 的构建工具接口，背后使用 **BuildKit** 构建引擎。[Docker 的 GitHub Actions 构建指南](https://docs.docker.com/build/ci/github-actions/)
+
+当前 `.github/workflows/ci.yml` 的第二个 Job 是：
+
+```yaml
+docker-build:
+  needs: test
+  runs-on: ubuntu-latest
+
+  steps:
+    - name: 检出代码
+      uses: actions/checkout@v7
+
+    - name: 配置 Docker Buildx
+      uses: docker/setup-buildx-action@v4
+
+    - name: 构建 Docker 镜像
+      uses: docker/build-push-action@v7
+      with:
+        context: .
+        file: Dockerfile
+        push: false
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+```
+
+`context: .` 指向仓库根目录作为构建上下文，`file: Dockerfile` 选择根目录的 Dockerfile。当前 `.dockerignore` 排除了 `.env`、`.git/`、日志和临时目录，避免把它们送入构建上下文。Dockerfile 先复制 `go.mod` 和 `go.sum` 下载依赖，再复制源码编译；当只修改 Go 业务代码而依赖文件没变时，依赖下载层有机会复用缓存。
+
+这里的 `push: false` 很关键：它只让构建步骤验证镜像可以生成，**不会把镜像推送到仓库**。当前配置也没有 `load: true`，因此不能把这个 Job 的结果当成已经安装到 Runner 本地 Docker 中、可供后续 Job 直接运行的镜像。想在别的机器上拉取它，还需要发布到 Registry。[build-push-action 输入说明](https://github.com/docker/build-push-action)
+
+## Docker Build Cache
+
+每次 GitHub Actions 运行通常使用新 Runner。第一次构建下载过的 Go 模块和构建层，下一次运行不能直接从上一台 Runner 的本地磁盘读取。我们在构建步骤中配置了外部缓存：
+
+```yaml
+cache-from: type=gha
+cache-to: type=gha,mode=max
+```
+
+`type=gha` 表示 GitHub Actions Cache 后端。`cache-from` 尝试取回以前的 BuildKit 构建缓存；`cache-to` 把本次构建缓存导出，供后续运行复用。`mode=max` 会尽量导出包括中间构建阶段在内的缓存，因此对我们的两阶段 Dockerfile 更有用。[Docker 的 Actions Cache 说明](https://docs.docker.com/build/cache/backends/gha/)
+
+这与 `test` Job 中 `actions/setup-go` 的缓存不是同一份东西：前者服务于 **Dockerfile 内的 BuildKit 构建**，后者服务于 **Runner 上执行的 Go 命令**。缓存也不是“保证每次都跳过构建”：首次运行没有可用缓存；修改 `go.mod` 或 `go.sum` 会影响依赖层；修改源码会让后续 `COPY . .` 和编译层重新计算。我们可以在 Actions 的“构建 Docker 镜像”日志里观察哪些步骤命中了缓存，再判断它有没有带来实际加速。
+
+## Docker Container Registry
+
+现在 `docker-build` Job 通过，证明这次提交能够构建镜像，但 Job 结束后我们还没有一个能从服务器拉取的镜像地址。Docker Container Registry（容器镜像仓库）解决的是**存储和分发镜像**的问题。将来可以把构建结果发布到 GitHub Container Registry（GHCR），再由部署机器按镜像名称和版本拉取。[GitHub Container Registry 文档](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry)
+
+到目前为止，流水线的实际边界是：`test` 成功 → `docker-build` 构建并缓存 → **不推送**。下一步再讨论 GHCR 登录、发布权限和镜像 Tag；尤其要区分 PR 的“只构建验证”与 `main` 分支的“允许发布”，避免把未经合并的代码直接发布出去。

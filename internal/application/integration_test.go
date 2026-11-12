@@ -340,6 +340,8 @@ func MigrateUp() error {
 	if err != nil {
 		return fmt.Errorf("invalid MYSQL_GO_DSN: %w", err)
 	}
+
+	// 确保两个连接都指向 go_backend_test 数据库
 	migrateConfig, err := mysql.ParseDSN(strings.TrimPrefix(dbURL, "mysql://"))
 	if err != nil {
 		return fmt.Errorf("invalid MIGRATE_TEST_DATABASE_URL: %w", err)
