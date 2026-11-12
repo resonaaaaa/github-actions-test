@@ -229,7 +229,7 @@ jobs:
 
 第一个 Go CI 已经能在干净的 Runner 上启动 MySQL、执行 Migration、运行订单测试并编译代码。接下来会遇到一个问题：**既然代码已经通过检查，能不能顺手把将来要部署的 Docker 镜像也构建出来？**
 
-我们在上一章已经写好两阶段 `Dockerfile`：第一阶段用 Go 编译 `./cmd/server`，第二阶段只把可执行文件放进 Alpine 运行镜像。现在让 GitHub Actions 在测试通过后执行这份 Dockerfile。本节先验证镜像能构建，发布到镜像仓库留到下一步。
+我们在上一章已经写好两阶段 `Dockerfile`：第一阶段用 Go 编译 `./cmd/server`，第二阶段只把可执行文件放进 Alpine 运行镜像。现在让 GitHub Actions 在测试通过后执行这份 Dockerfile。我们先验证镜像能构建，再把通过检查的镜像发布到 GHCR。
 
 ## 利用 `needs` 建立 Quality Gate
 
@@ -257,7 +257,7 @@ jobs:
 
 我们本机执行过 `docker build`。在 Actions 里，当前项目用 `docker/setup-buildx-action` 准备 **Buildx**，再用 `docker/build-push-action` 执行构建。Buildx 是 Docker 的构建工具接口，背后使用 **BuildKit** 构建引擎。[Docker 的 GitHub Actions 构建指南](https://docs.docker.com/build/ci/github-actions/)
 
-当前 `.github/workflows/ci.yml` 的第二个 Job 是：
+最初，`.github/workflows/ci.yml` 的第二个 Job 先写成：
 
 ```yaml
 docker-build:
@@ -283,7 +283,7 @@ docker-build:
 
 `context: .` 指向仓库根目录作为构建上下文，`file: Dockerfile` 选择根目录的 Dockerfile。当前 `.dockerignore` 排除了 `.env`、`.git/`、日志和临时目录，避免把它们送入构建上下文。Dockerfile 先复制 `go.mod` 和 `go.sum` 下载依赖，再复制源码编译；当只修改 Go 业务代码而依赖文件没变时，依赖下载层有机会复用缓存。
 
-这里的 `push: false` 很关键：它只让构建步骤验证镜像可以生成，**不会把镜像推送到仓库**。当前配置也没有 `load: true`，因此不能把这个 Job 的结果当成已经安装到 Runner 本地 Docker 中、可供后续 Job 直接运行的镜像。想在别的机器上拉取它，还需要发布到 Registry。[build-push-action 输入说明](https://github.com/docker/build-push-action)
+此时的 `push: false` 很关键：它只让构建步骤验证镜像可以生成，**不会把镜像推送到仓库**。这个初版配置也没有 `load: true`，因此不能把这个 Job 的结果当成已经安装到 Runner 本地 Docker 中、可供后续 Job 直接运行的镜像。想在别的机器上拉取它，还需要发布到 Registry。[build-push-action 输入说明](https://github.com/docker/build-push-action)
 
 ## Docker Build Cache
 
@@ -298,8 +298,91 @@ cache-to: type=gha,mode=max
 
 这与 `test` Job 中 `actions/setup-go` 的缓存不是同一份东西：前者服务于 **Dockerfile 内的 BuildKit 构建**，后者服务于 **Runner 上执行的 Go 命令**。缓存也不是“保证每次都跳过构建”：首次运行没有可用缓存；修改 `go.mod` 或 `go.sum` 会影响依赖层；修改源码会让后续 `COPY . .` 和编译层重新计算。我们可以在 Actions 的“构建 Docker 镜像”日志里观察哪些步骤命中了缓存，再判断它有没有带来实际加速。
 
-## Docker Container Registry
+## Docker Container Registry：把镜像交给 GHCR
 
-现在 `docker-build` Job 通过，证明这次提交能够构建镜像，但 Job 结束后我们还没有一个能从服务器拉取的镜像地址。Docker Container Registry（容器镜像仓库）解决的是**存储和分发镜像**的问题。将来可以把构建结果发布到 GitHub Container Registry（GHCR），再由部署机器按镜像名称和版本拉取。[GitHub Container Registry 文档](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry)
+前面 `push: false` 的配置只验证 Dockerfile 能构建。Job 一结束，另一台服务器既拿不到这个 Runner 的构建结果，也不能凭源码提交号直接执行 `docker pull`。我们需要一个 **Container Registry（容器镜像仓库）** 保存并分发构建产物。这里选 GitHub Container Registry，简称 **GHCR**；镜像地址形如 `ghcr.io/<仓库所有者>/<仓库名>:<标签>`。[GitHub Container Registry 文档](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry)
 
-到目前为止，流水线的实际边界是：`test` 成功 → `docker-build` 构建并缓存 → **不推送**。下一步再讨论 GHCR 登录、发布权限和镜像 Tag；尤其要区分 PR 的“只构建验证”与 `main` 分支的“允许发布”，避免把未经合并的代码直接发布出去。
+### 先想清楚镜像标签
+
+假设今天和明天都向 `main` 提交了代码，两次构建都叫 `latest`。明天的镜像发布后，`latest` 就会指向新的内容。想重新部署今天的版本时，单靠 `latest` 无法准确找到它。
+
+尽管GitHub Actions提供了功能强大的**表达式**，可以让我们手动拼接标签[GitHub Actions 表达式](https://docs.github.com/zh/actions/learn-github-actions/expressions)，但手动拼接容易出错。我们当前让 `docker/metadata-action` 根据触发事件生成标签，自动化程度更高，也更容易维护:
+
+| 触发事件 | 生成的标签示例 | 是否推送 GHCR |
+| --- | --- | --- |
+| 向 `main` 提交 | `main`、`sha-a81f93c`、`latest` | 是 |
+| 向 `main` 发起 PR | `pr-12`，以及对应的 `sha-*` | 否，只构建验证 |
+| 推送 `v0.1.0` Git Tag | `0.1.0`、`sha-a81f93c` | 是 |
+
+这里 `main` 和 `latest` 都是会移动的名称；`sha-*` 对应构建所用的提交，更方便追溯源码。Git Tag `v0.1.0` 经 `type=semver,pattern={{version}}` 生成镜像标签 `0.1.0`。但**标签本身可以被重新指向**；需要精确记录部署镜像时，还应保存 Registry 返回的 `sha256` Digest。Digest 标识镜像内容，适合作为日后核对或回滚的依据。[metadata-action 标签规则](https://github.com/docker/metadata-action)
+
+### 在 Workflow 中登录、生成标签、发布
+
+现在看项目 `.github/workflows/ci.yml` 的构建 Job。下面是与 GHCR 有关的配置；原有的检出代码、配置 Buildx 和 `needs: test` 仍然保留：
+
+```yaml
+on:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  docker-build:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      # 前面还有 checkout 和 setup-buildx
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 生成tag
+        id: tag
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          flavor: latest=false
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: 构建 Docker 镜像
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.tag.outputs.tags }}
+          labels: ${{ steps.tag.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+```
+
+先看权限。`contents: read` 用于读取仓库，`packages: write` 允许这个 Job 发布 Package；它们只写在 `docker-build` Job 下，没有扩大到整个 Workflow。`GITHUB_TOKEN` 由 GitHub 为运行自动提供，发布与当前仓库关联的 Package 时无需在文件中写入长期令牌。[GitHub 的 Package 发布说明](https://docs.github.com/en/packages/managing-github-packages-using-github-actions-workflows/publishing-and-installing-a-package-with-github-actions)
+
+再看发布条件。PR 也会触发测试和镜像构建，但登录步骤被 `if` 跳过，`push` 表达式也会得到 `false`；向 `main` 或 `v*` Tag 推送时，测试成功后才登录并推送。**生成 `pr-12` 这样的标签不等于把它发布到 GHCR。** `needs: test` 仍然守在发布前面：测试不通过，构建和推送都不会开始。
+
+`metadata-action` 输出的 `tags` 与 `labels` 被下一步直接引用。`type=raw` 的条件参数必须写成 `enable=`；我们也设置 `flavor: latest=false`，关闭 SemVer Tag 默认自动生成 `latest` 的行为。这样 `latest` 只在 `main` 分支条件成立时由那条 `type=raw` 规则生成，推送版本 Tag 不会意外移动它。[metadata-action 的 `latest` 规则](https://github.com/docker/metadata-action#latest-tag)
+
+这里还有一个权限边界：当前 `packages: write` 授给了整个 `docker-build` Job，而这个 Job 也会处理 PR。虽然 `if` 与 `push` 已阻止 PR 发布，权限本身仍比“只构建的 PR”所需范围大。Fork PR 的令牌通常会受到 GitHub 的只读限制；若以后要让同仓库 PR 也完全拿不到发布权限，应把只读构建与仅在可信推送事件运行的发布 Job 拆开。**不能只把 `push: false` 当作权限隔离。**[GitHub 关于 PR 令牌的说明](https://docs.github.com/en/actions/reference/security/securely-using-pull_request_target)
+
+### 如何验证这一阶段
+
+向 `main` 推送后，在 Actions 中确认 `test` 成功、`docker-build` 成功，再到仓库的 Packages 页面查找对应镜像。如果在 GitHub 看到了第一个 Package，就说明首次发布完成；接下来可以核对它的 `main`、`sha-*`、`latest` 标签与 Digest。若 Package 是私有的，其他机器拉取前还需要具备相应的读取权限。[GHCR 的访问说明](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry)
+
+目前我们完成的是 **源码 → 测试 → 构建 → GHCR 发布**。镜像已可分发，但还没有把它接入生产环境的 Docker Compose，也没有完成正式 Release 和部署回滚。下一节再把 Git Tag、镜像 Tag 与 Digest 的关系用于版本化交付。
+
+# Release 与部署回滚
